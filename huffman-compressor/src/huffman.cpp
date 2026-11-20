@@ -1,118 +1,24 @@
 #include "huffman.hpp"
+#include "huffman_tree.hpp"
+#include "bit_stream.hpp"
+#include "thread_pool.hpp"
+
 #include <fstream>
-#include <queue>
 #include <iostream>
 #include <cstring>
 #include <algorithm>
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
+#include <map>
+#include <unordered_map>
 
 using namespace std;
 
 namespace {
-struct NodeCompare {
-    bool operator()(const HuffmanNode* a, const HuffmanNode* b) const {
-        return a->freq > b->freq; // min-heap
-    }
-};
 
 // =============================================================================
-// ThreadPool using standard C++17 std::thread, std::mutex, std::condition_variable
+// Chunk Sizing Configuration
 // =============================================================================
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t numThreads) : stop(false), completedTasks(0) {
-        for (size_t i = 0; i < numThreads; ++i) {
-            workers.emplace_back([this] {
-                workerLoop();
-            });
-        }
-    }
-
-    ~ThreadPool() {
-        {
-            unique_lock<mutex> lock(mtx);
-            stop = true;
-        }
-        cv.notify_all();
-
-        for (thread& w : workers) {
-            if (w.joinable()) {
-                w.join();
-            }
-        }
-    }
-
-    void submit(void (*func)(void*), void* arg) {
-        {
-            unique_lock<mutex> lock(mtx);
-            tasks.push({func, arg});
-        }
-        cv.notify_one();
-    }
-
-    void waitAll(size_t totalTasks) {
-        unique_lock<mutex> lock(mtx);
-        cvWait.wait(lock, [this, totalTasks] {
-            return completedTasks >= totalTasks;
-        });
-    }
-
-    void notifyTaskDone() {
-        {
-            unique_lock<mutex> lock(mtx);
-            completedTasks++;
-        }
-        cvWait.notify_one();
-    }
-
-private:
-    struct Task {
-        void (*func)(void*);
-        void* arg;
-    };
-
-    void workerLoop() {
-        while (true) {
-            Task task = {nullptr, nullptr};
-            {
-                unique_lock<mutex> lock(mtx);
-                cv.wait(lock, [this] {
-                    return stop || !tasks.empty();
-                });
-
-                if (stop && tasks.empty()) {
-                    return;
-                }
-
-                task = tasks.front();
-                tasks.pop();
-            }
-
-            if (task.func) {
-                task.func(task.arg);
-            }
-            notifyTaskDone();
-        }
-    }
-
-    vector<thread> workers;
-    queue<Task> tasks;
-    mutex mtx;
-    condition_variable cv;
-    condition_variable cvWait;
-    bool stop;
-    size_t completedTasks;
-};
-
-unsigned int getHardwareConcurrency() {
-    unsigned int count = thread::hardware_concurrency();
-    return count > 0 ? count : 4;
-}
-
-static const size_t TARGET_CHUNK_SIZE = 512;
+static const size_t TARGET_CHUNK_SIZE = 512; // bytes per task
 
 size_t calculateNumChunks(size_t totalSize, unsigned int numThreads) {
     if (totalSize == 0) return 0;
@@ -125,51 +31,36 @@ size_t calculateNumChunks(size_t totalSize, unsigned int numThreads) {
     return numChunks;
 }
 
-} // anonymous namespace
-
 // =============================================================================
-// BitReader / BitWriter
+// Binary Header Serialization Helpers (Little-Endian)
 // =============================================================================
+void writeU64(ofstream& out, uint64_t v) {
+    for (int i = 0; i < 8; i++) out.put(static_cast<char>((v >> (8 * i)) & 0xFF));
+}
 
-void BitWriter::writeBit(bool bit) {
-    current = (current << 1) | (bit ? 1 : 0);
-    bitCount++;
-    if (bitCount == 8) {
-        buffer.push_back(current);
-        current = 0;
-        bitCount = 0;
+uint64_t readU64(ifstream& in) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) {
+        uint8_t b = static_cast<uint8_t>(in.get());
+        v |= (static_cast<uint64_t>(b) << (8 * i));
     }
+    return v;
 }
 
-void BitWriter::writeBits(const HuffmanCode& bits) {
-    for (bool b : bits) writeBit(b);
+void writeU16(ofstream& out, uint16_t v) {
+    out.put(static_cast<char>(v & 0xFF));
+    out.put(static_cast<char>((v >> 8) & 0xFF));
 }
 
-void BitWriter::flush() {
-    if (bitCount > 0) {
-        current <<= (8 - bitCount);
-        buffer.push_back(current);
-        current = 0;
-        bitCount = 0;
-    }
-}
-
-bool BitReader::readBit(bool& bit) {
-    if (bytePos >= buffer.size()) return false;
-    uint8_t byte = buffer[bytePos];
-    bit = (byte >> (7 - bitPos)) & 1;
-    bitPos++;
-    if (bitPos == 8) {
-        bitPos = 0;
-        bytePos++;
-    }
-    return true;
+uint16_t readU16(ifstream& in) {
+    uint8_t lo = static_cast<uint8_t>(in.get());
+    uint8_t hi = static_cast<uint8_t>(in.get());
+    return static_cast<uint16_t>(lo | (hi << 8));
 }
 
 // =============================================================================
-// Parallel Frequency Counting using Thread Pool & Work Queue
+// Parallel Frequency Counting
 // =============================================================================
-
 struct FreqTaskContext {
     const vector<uint8_t>* data;
     size_t start;
@@ -177,18 +68,18 @@ struct FreqTaskContext {
     vector<uint64_t> localFreq;
 };
 
-static void runFreqTask(void* param) {
-    FreqTaskContext* ctx = static_cast<FreqTaskContext*>(param);
+void runFreqTask(void* param) {
+    auto* ctx = static_cast<FreqTaskContext*>(param);
     ctx->localFreq.assign(256, 0);
     for (size_t j = ctx->start; j < ctx->end; ++j) {
         ctx->localFreq[(*ctx->data)[j]]++;
     }
 }
 
-map<uint8_t, uint64_t> Huffman::buildFrequencyTable(const vector<uint8_t>& data) {
+map<uint8_t, uint64_t> buildFrequencyTableParallel(const vector<uint8_t>& data) {
     if (data.empty()) return {};
 
-    unsigned int threadnum = getHardwareConcurrency();
+    unsigned int threadnum = ThreadPool::getHardwareConcurrency();
     size_t totalSize = data.size();
     size_t numChunks = calculateNumChunks(totalSize, threadnum);
     size_t chunkSize = totalSize / numChunks;
@@ -216,79 +107,9 @@ map<uint8_t, uint64_t> Huffman::buildFrequencyTable(const vector<uint8_t>& data)
     return globalFreq;
 }
 
-unique_ptr<HuffmanNode> Huffman::buildTree(const map<uint8_t, uint64_t>& freqTable) {
-    priority_queue<HuffmanNode*, vector<HuffmanNode*>, NodeCompare> pq; 
-    for (auto& entry : freqTable) {
-        auto* leaf = new HuffmanNode();
-        leaf->byte = entry.first;
-        leaf->freq = entry.second;
-        leaf->isLeaf = true;
-        pq.push(leaf);
-    }
-    while (pq.size() > 1) {
-        HuffmanNode* a = pq.top(); pq.pop();
-        HuffmanNode* b = pq.top(); pq.pop();
-        auto* parent = new HuffmanNode();
-        parent->freq = (a->freq) + (b->freq);
-        parent->left.reset(a);
-        parent->right.reset(b);
-        pq.push(parent);
-    }
-
-    unique_ptr<HuffmanNode> root = nullptr;
-    if (!pq.empty()) {
-        root.reset(pq.top());
-    }
-    return root;
-}
-
-void Huffman::buildCodeTable(const HuffmanNode* node, HuffmanCode& prefix,
-                             unordered_map<uint8_t, HuffmanCode>& table) {
-    if (!node) return;
-    if (node->isLeaf) {
-        table[node->byte] = prefix;
-        return;
-    }
-    prefix.push_back(false);
-    buildCodeTable(node->left.get(), prefix, table);
-    prefix.pop_back();
-
-    prefix.push_back(true);
-    buildCodeTable(node->right.get(), prefix, table);
-    prefix.pop_back();
-}
-
 // =============================================================================
-// File Format Helpers
+// Parallel Chunk Encoding
 // =============================================================================
-
-namespace {
-void writeU64(ofstream& out, uint64_t v) {
-    for (int i = 0; i < 8; i++) out.put(static_cast<char>((v >> (8 * i)) & 0xFF));
-}
-uint64_t readU64(ifstream& in) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) {
-        uint8_t b = static_cast<uint8_t>(in.get());
-        v |= (static_cast<uint64_t>(b) << (8 * i));
-    }
-    return v;
-}
-void writeU16(ofstream& out, uint16_t v) {
-    out.put(static_cast<char>(v & 0xFF));
-    out.put(static_cast<char>((v >> 8) & 0xFF));
-} 
-uint16_t readU16(ifstream& in) {
-    uint8_t lo = static_cast<uint8_t>(in.get());
-    uint8_t hi = static_cast<uint8_t>(in.get());
-    return static_cast<uint16_t>(lo | (hi << 8));
-}
-}
-
-// =============================================================================
-// Parallel Encoding using Thread Pool & Work Queue
-// =============================================================================
-
 struct EncodeTaskContext {
     const vector<uint8_t>* data;
     size_t start;
@@ -297,8 +118,8 @@ struct EncodeTaskContext {
     vector<uint8_t> compressedChunk;
 };
 
-static void runEncodeTask(void* param) {
-    EncodeTaskContext* ctx = static_cast<EncodeTaskContext*>(param);
+void runEncodeTask(void* param) {
+    auto* ctx = static_cast<EncodeTaskContext*>(param);
     BitWriter writer(ctx->compressedChunk);
     for (size_t i = ctx->start; i < ctx->end; ++i) {
         writer.writeBits(ctx->codeTable->at((*ctx->data)[i]));
@@ -306,10 +127,43 @@ static void runEncodeTask(void* param) {
     writer.flush();
 }
 
+// =============================================================================
+// Parallel Chunk Decoding
+// =============================================================================
+struct DecodeTaskContext {
+    const vector<uint8_t>* compressedChunk;
+    const HuffmanNode* root;
+    uint64_t targetByteCount;
+    vector<uint8_t> decodedChunk;
+};
+
+void runDecodeTask(void* param) {
+    auto* ctx = static_cast<DecodeTaskContext*>(param);
+    BitReader reader(*ctx->compressedChunk);
+    ctx->decodedChunk.reserve(ctx->targetByteCount);
+
+    const HuffmanNode* node = ctx->root;
+    bool bit;
+
+    while (ctx->decodedChunk.size() < ctx->targetByteCount && reader.readBit(bit)) {
+        node = bit ? node->right.get() : node->left.get();
+        if (node->isLeaf) {
+            ctx->decodedChunk.push_back(node->byte);
+            node = ctx->root;
+        }
+    }
+}
+
+} // anonymous namespace
+
+// =============================================================================
+// Public Huffman API
+// =============================================================================
+
 bool Huffman::compressFile(const string& inputPath, const string& outputPath) {
     ifstream in(inputPath, ios::binary);
     if (!in) {
-        cerr << "Error: file input error " << inputPath << endl;
+        cerr << "Error: cannot open input file " << inputPath << endl;
         return false;
     }
     vector<uint8_t> data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
@@ -317,7 +171,7 @@ bool Huffman::compressFile(const string& inputPath, const string& outputPath) {
 
     ofstream out(outputPath, ios::binary);
     if (!out) {
-        cerr << "Error: output file error " << outputPath << endl;
+        cerr << "Error: cannot open output file " << outputPath << endl;
         return false;
     }
 
@@ -329,7 +183,7 @@ bool Huffman::compressFile(const string& inputPath, const string& outputPath) {
         return true;
     }
 
-    auto freqTable = buildFrequencyTable(data);
+    auto freqTable = buildFrequencyTableParallel(data);
     writeU16(out, static_cast<uint16_t>(freqTable.size()));
     for (const auto& entry : freqTable) {
         out.put(static_cast<char>(entry.first));
@@ -337,15 +191,15 @@ bool Huffman::compressFile(const string& inputPath, const string& outputPath) {
     }
 
     if (freqTable.size() == 1) {
-        return true;
+        return true; // Single unique symbol requires no bitstream
     }
 
-    auto root = buildTree(freqTable);
+    auto root = buildHuffmanTree(freqTable);
     unordered_map<uint8_t, HuffmanCode> codeTable;
     HuffmanCode prefix;
-    buildCodeTable(root.get(), prefix, codeTable);
+    buildHuffmanCodeTable(root.get(), prefix, codeTable);
 
-    unsigned int numThreads = getHardwareConcurrency();
+    unsigned int numThreads = ThreadPool::getHardwareConcurrency();
     size_t totalSize = data.size();
     size_t numChunks = calculateNumChunks(totalSize, numThreads);
     size_t chunkSize = totalSize / numChunks;
@@ -363,53 +217,26 @@ bool Huffman::compressFile(const string& inputPath, const string& outputPath) {
 
     pool.waitAll(numChunks);
 
-    // Write Chunk Header Information
+    // Write chunk header metadata
     writeU16(out, static_cast<uint16_t>(numChunks));
 
     for (size_t i = 0; i < numChunks; ++i) {
         writeU64(out, contexts[i].compressedChunk.size());
     }
 
+    // Write compressed bitstream bytes
     for (size_t i = 0; i < numChunks; ++i) {
         out.write(reinterpret_cast<const char*>(contexts[i].compressedChunk.data()),
                   static_cast<streamsize>(contexts[i].compressedChunk.size()));
     }
-    
+
     return true;
-}
-
-// =============================================================================
-// Parallel Decoding using Thread Pool & Work Queue
-// =============================================================================
-
-struct DecodeTaskContext {
-    const vector<uint8_t>* compressedChunk;
-    const HuffmanNode* root;
-    uint64_t targetByteCount;
-    vector<uint8_t> decodedChunk;
-};
-
-static void runDecodeTask(void* param) {
-    DecodeTaskContext* ctx = static_cast<DecodeTaskContext*>(param);
-    BitReader reader(*ctx->compressedChunk);
-    ctx->decodedChunk.reserve(ctx->targetByteCount);
-
-    const HuffmanNode* node = ctx->root;
-    bool bit;
-
-    while (ctx->decodedChunk.size() < ctx->targetByteCount && reader.readBit(bit)) {
-        node = bit ? node->right.get() : node->left.get();
-        if (node->isLeaf) {
-            ctx->decodedChunk.push_back(node->byte);
-            node = ctx->root;
-        }
-    }
 }
 
 bool Huffman::decompressFile(const string& inputPath, const string& outputPath) {
     ifstream in(inputPath, ios::binary);
     if (!in) {
-        cerr << "Error: file input error decompress " << inputPath << endl;
+        cerr << "Error: cannot open input file " << inputPath << endl;
         return false;
     }
     char magic[4];
@@ -424,7 +251,7 @@ bool Huffman::decompressFile(const string& inputPath, const string& outputPath) 
 
     ofstream out(outputPath, ios::binary);
     if (!out) {
-        cerr << "Error: could not open output file " << outputPath << endl;
+        cerr << "Error: cannot open output file " << outputPath << endl;
         return false;
     }
 
@@ -451,7 +278,7 @@ bool Huffman::decompressFile(const string& inputPath, const string& outputPath) 
         return true;
     }
 
-    auto root = buildTree(freqTable);
+    auto root = buildHuffmanTree(freqTable);
 
     uint16_t numChunks = readU16(in);
     vector<uint64_t> chunkSizes(numChunks);
@@ -471,7 +298,7 @@ bool Huffman::decompressFile(const string& inputPath, const string& outputPath) 
         targetByteCounts[i] = (i == numChunks - 1) ? (originalSize - i * baseChunkSize) : baseChunkSize;
     }
 
-    unsigned int numThreads = getHardwareConcurrency();
+    unsigned int numThreads = ThreadPool::getHardwareConcurrency();
     ThreadPool pool(numThreads);
     vector<DecodeTaskContext> contexts(numChunks);
 
